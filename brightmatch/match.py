@@ -9,10 +9,6 @@ Data model
 * Every pixel sample and every luma value is linear light in ``[0.0, 1.0]``.
 * Every gain is expressed in decibels (dB); ``20 dB`` is a 10x linear factor.
 * Tests compare floating-point values with an absolute tolerance of ``1e-6``.
-
-All eight public functions in this module are currently intentional stubs and
-raise :class:`NotImplementedError`. The tests in ``tests/test_match.py`` are
-the executable specification.
 """
 
 from __future__ import annotations
@@ -39,44 +35,82 @@ _B_WEIGHT = 0.0722
 # A pixel at or above this luma is treated as an overexposed/clipped sample.
 _OVEREXPOSED_LUMA = 0.98
 
+# Tolerance used at range boundaries during validation.
+_EPS = 1e-6
+
 
 class BrightnessError(ValueError):
     """Raised when brightness input or configuration violates a contract."""
 
 
+def _clamp01(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+def _pixel_luma(pixel: list[float]) -> float:
+    r = _clamp01(pixel[0])
+    g = _clamp01(pixel[1])
+    b = _clamp01(pixel[2])
+    return _R_WEIGHT * r + _G_WEIGHT * g + _B_WEIGHT * b
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    """Percentile with linear interpolation between order statistics."""
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    rank = (pct / 100.0) * (n - 1)
+    low = int(math.floor(rank))
+    high = min(low + 1, n - 1)
+    frac = rank - low
+    return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+
+
 def shot_luma(frame: list[list[float]]) -> float:
-    """Return the percentile-clipped mean Rec.709 luma of one frame.
+    """Return the percentile-clipped mean Rec.709 luma of one frame."""
+    if not frame:
+        raise BrightnessError("frame is empty")
 
-    ``frame`` is a non-empty 2-D RGB frame. Each channel is clamped to the
-    linear range ``[0.0, 1.0]`` and converted with the Rec.709 weights
-    ``0.2126*R + 0.7152*G + 0.0722*B``. The resulting per-pixel luma values
-    are winsorized at their 5th and 95th percentiles (values are capped, not
-    dropped), so a frame with fewer than two pixels is unchanged, and the
-    clipped values are averaged.
+    lumas: list[float] = []
+    for row in frame:
+        if len(row) != 3:
+            raise BrightnessError("frame row is not an RGB pixel")
+        lumas.append(_pixel_luma(row))
 
-    Raises :class:`BrightnessError` for an empty frame or a non-RGB row.
-    Results are compared with an absolute tolerance of ``1e-6``.
-    """
+    if len(lumas) < 2:
+        return lumas[0]
 
-    raise NotImplementedError("shot_luma is not implemented")
+    ordered = sorted(lumas)
+    lo = _percentile(ordered, 5.0)
+    hi = _percentile(ordered, 95.0)
+    clipped = [min(hi, max(lo, value)) for value in lumas]
+    return sum(clipped) / len(clipped)
 
 
 def shot_stats(shot: list[list[list[float]]]) -> dict[str, float]:
-    """Return robust luma statistics for one whole shot.
+    """Return robust luma statistics for one whole shot."""
+    if not shot:
+        return {}
 
-    The result is ``{"mean": float, "p10": float, "p90": float}`` computed
-    over the Rec.709 luma of every pixel in every frame. Pixels whose luma is
-    at or above ``0.98`` are treated as clipped highlights and excluded before
-    any statistic is computed, so isolated overexposed pixels cannot lift the
-    mean or the upper percentile. ``p10`` and ``p90`` use linear interpolation
-    between order statistics.
+    lumas: list[float] = []
+    for frame in shot:
+        for row in frame:
+            if len(row) != 3:
+                raise BrightnessError("frame row is not an RGB pixel")
+            luma = _pixel_luma(row)
+            if luma >= _OVEREXPOSED_LUMA:
+                continue
+            lumas.append(luma)
 
-    An empty shot returns ``{}``. A non-empty shot with no usable (that is,
-    non-overexposed) pixels raises :class:`BrightnessError`. Statistics are
-    compared with an absolute tolerance of ``1e-6``.
-    """
+    if not lumas:
+        raise BrightnessError("shot has no usable (non-overexposed) pixels")
 
-    raise NotImplementedError("shot_stats is not implemented")
+    ordered = sorted(lumas)
+    return {
+        "mean": sum(lumas) / len(lumas),
+        "p10": _percentile(ordered, 10.0),
+        "p90": _percentile(ordered, 90.0),
+    }
 
 
 def match_gain(
@@ -84,112 +118,185 @@ def match_gain(
     cur: list[list[list[float]]],
     mode: str = "mean",
 ) -> float:
-    """Return the gain in dB that makes ``cur`` match ``ref``.
+    """Return the gain in dB that makes ``cur`` match ``ref``."""
+    if mode not in ("mean", "percentile"):
+        raise BrightnessError(f"unknown mode: {mode!r}")
 
-    Both arguments are shots. ``mode="mean"`` matches the robust mean from
-    :func:`shot_stats`; ``mode="percentile"`` matches the midpoint of the
-    ``p10`` and ``p90`` levels. The result is
-    ``20 * log10(ref_level / cur_level)``, so a gain of ``0.0`` means the two
-    shots already match. A non-positive level, an unknown mode, or an empty
-    shot raises :class:`BrightnessError`.
+    ref_stats = shot_stats(ref)
+    cur_stats = shot_stats(cur)
+    if not ref_stats or not cur_stats:
+        raise BrightnessError("cannot match gain for an empty shot")
 
-    The returned dB value is compared with an absolute tolerance of ``1e-6``.
-    """
+    if mode == "mean":
+        ref_level = ref_stats["mean"]
+        cur_level = cur_stats["mean"]
+    else:
+        ref_level = 0.5 * (ref_stats["p10"] + ref_stats["p90"])
+        cur_level = 0.5 * (cur_stats["p10"] + cur_stats["p90"])
 
-    raise NotImplementedError("match_gain is not implemented")
+    if ref_level <= 0.0 or cur_level <= 0.0:
+        raise BrightnessError("cannot match gain for a non-positive level")
+
+    return 20.0 * math.log10(ref_level / cur_level)
 
 
 def apply_gain(frame: list[list[float]], db: float) -> list[list[float]]:
-    """Apply a linear gain to every channel of ``frame`` and clamp to 0..1.
+    """Apply a linear gain to every channel of ``frame`` and clamp to 0..1."""
+    if not frame:
+        return []
 
-    The linear factor is ``10 ** (db / 20)``. The returned frame has the same
-    shape as the input and never aliases it. Every output sample is clamped to
-    the linear range ``[0.0, 1.0]``; in particular, values that would exceed
-    white become ``1.0`` instead of wrapping or turning into dark spots.
-    An empty frame returns ``[]``.
-
-    Output samples are compared with an absolute tolerance of ``1e-6``.
-    """
-
-    raise NotImplementedError("apply_gain is not implemented")
+    factor = 10.0 ** (db / 20.0)
+    return [[_clamp01(sample * factor) for sample in row] for row in frame]
 
 
 def smooth_gains(gains: list[float], window: int) -> list[float]:
-    """Smooth per-shot gains across neighbouring shots to avoid jumps.
+    """Smooth per-shot gains across neighbouring shots to avoid jumps."""
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise BrightnessError("window must be an integer")
+    if window <= 0:
+        raise BrightnessError("window must be positive")
+    if window % 2 == 0:
+        raise BrightnessError("window must be odd")
 
-    ``gains`` contains gains in dB. ``window`` must be a positive odd integer;
-    each output is the arithmetic mean of the gains in the centred window,
-    with edge windows truncated to the available samples. The result has the
-    same length and order as ``gains``. A non-positive, even, or non-integer
-    window raises :class:`BrightnessError`, including ``window == 0`` and
-    ``window < 0``. An empty ``gains`` list returns ``[]``.
+    if not gains:
+        return []
 
-    Smoothed values are compared with an absolute tolerance of ``1e-6``.
-    """
-
-    raise NotImplementedError("smooth_gains is not implemented")
+    half = window // 2
+    n = len(gains)
+    smoothed: list[float] = []
+    for i in range(n):
+        start = max(0, i - half)
+        end = min(n, i + half + 1)
+        segment = gains[start:end]
+        smoothed.append(sum(segment) / len(segment))
+    return smoothed
 
 
 def detect_outliers(gains: list[float], max_db: float) -> list[int]:
-    """Return indices of gain outliers relative to the batch median.
+    """Return indices of gain outliers relative to the batch median."""
+    if not isinstance(max_db, (int, float)) or isinstance(max_db, bool):
+        raise BrightnessError("max_db must be a number")
+    if not math.isfinite(max_db) or max_db < 0.0:
+        raise BrightnessError("max_db must be a non-negative finite threshold")
 
-    ``gains`` contains gains in dB. The median gain is computed from the
-    actual content of this list, and every index whose absolute distance from
-    that median is greater than ``max_db`` is returned in ascending order.
-    ``max_db`` is a required non-negative, finite threshold; this function
-    must not substitute a hard-coded 6 dB rule. Duplicate indices are never
-    returned. An empty list returns ``[]``.
+    if not gains:
+        return []
 
-    Comparisons use an absolute tolerance of ``1e-6`` for boundary values.
-    """
+    ordered = sorted(gains)
+    n = len(ordered)
+    if n % 2 == 1:
+        median = ordered[n // 2]
+    else:
+        median = 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
 
-    raise NotImplementedError("detect_outliers is not implemented")
+    return [
+        index
+        for index, gain in enumerate(gains)
+        if abs(gain - median) > max_db
+    ]
 
 
 def validate(shots: list[list[list[list[float]]]]) -> list[str]:
-    """Return a list of human-readable problems, or ``[]`` when valid.
+    """Return a list of human-readable problems, or ``[]`` when valid."""
+    problems: list[str] = []
 
-    Every shot and frame must be non-empty, every pixel must have exactly
-    three RGB channels, all frames in all shots must have identical height
-    and width, and every sample must be finite and inside the linear range
-    ``[0.0, 1.0]`` (so ``NaN`` and infinity are reported). Validation never
-    raises for malformed data; it reports every problem it can find. Numeric
-    checks use an absolute tolerance of ``1e-6`` at the range boundaries.
-    """
+    if not shots:
+        problems.append("batch contains no shots")
+        return problems
 
-    raise NotImplementedError("validate is not implemented")
+    expected_rows: int | None = None
+
+    for shot_index, shot in enumerate(shots):
+        if not shot:
+            problems.append(f"shot {shot_index} is empty")
+            continue
+        for frame_index, frame in enumerate(shot):
+            where = f"shot {shot_index} frame {frame_index}"
+            if not frame:
+                problems.append(f"{where} is empty")
+                continue
+            if expected_rows is None:
+                expected_rows = len(frame)
+            elif len(frame) != expected_rows:
+                problems.append(
+                    f"{where} has {len(frame)} rows; expected {expected_rows}"
+                )
+            for row_index, row in enumerate(frame):
+                pixel_where = f"{where} pixel {row_index}"
+                if len(row) != 3:
+                    problems.append(
+                        f"{pixel_where} has {len(row)} channels; expected 3 (RGB)"
+                    )
+                    continue
+                for channel, sample in enumerate(row):
+                    sample_where = f"{pixel_where} channel {channel}"
+                    if not isinstance(sample, (int, float)) or isinstance(
+                        sample, bool
+                    ):
+                        problems.append(f"{sample_where} is not a number")
+                        continue
+                    if math.isnan(sample):
+                        problems.append(f"{sample_where} is NaN")
+                        continue
+                    if math.isinf(sample):
+                        problems.append(f"{sample_where} is infinite")
+                        continue
+                    if sample < -_EPS or sample > 1.0 + _EPS:
+                        problems.append(
+                            f"{sample_where}={sample} is outside [0.0, 1.0]"
+                        )
+
+    return problems
 
 
 def match_batch(
     shots: list[list[list[list[float]]]],
     config: dict | None = None,
 ) -> dict:
-    """Match every shot in a batch against a reference shot.
+    """Match every shot in a batch against a reference shot."""
+    config = dict(config or {})
 
-    ``config`` supports:
+    mode = config.get("mode", "mean")
+    if mode not in ("mean", "percentile"):
+        raise BrightnessError(f"unknown mode: {mode!r}")
 
-    * ``"mode"``: ``"mean"`` (default) or ``"percentile"``;
-    * ``"window"``: positive odd smoothing window (default ``1``);
-    * ``"max_db"``: non-negative outlier threshold in dB (default ``6.0``);
-    * ``"reference"``: index of the reference shot (default ``0``).
+    window = config.get("window", 1)
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise BrightnessError("window must be an integer")
+    if window <= 0:
+        raise BrightnessError("window must be positive")
+    if window % 2 == 0:
+        raise BrightnessError("window must be odd")
 
-    The operation is atomic. The batch and configuration are fully validated
-    first; if any shot is empty, has inconsistent dimensions, contains a
-    non-finite or out-of-range sample, or if the configuration is invalid,
-    :class:`BrightnessError` is raised and no partial result is returned.
-    Each shot otherwise gets its own gain computed against the reference,
-    then the gains are smoothed and outliers are detected. The result is::
+    max_db = config.get("max_db", 6.0)
+    if not isinstance(max_db, (int, float)) or isinstance(max_db, bool):
+        raise BrightnessError("max_db must be a number")
+    if not math.isfinite(max_db) or max_db < 0.0:
+        raise BrightnessError("max_db must be a non-negative finite threshold")
 
-        {
-            "gains": list[float],       # raw per-shot dB gains
-            "smoothed": list[float],    # smoothed per-shot dB gains
-            "outliers": list[int],      # indices into the gain lists
-            "shots": list[list[list[float]]],  # gained shots, input order
-            "reference": int,
-        }
+    problems = validate(shots)
+    if problems:
+        raise BrightnessError("invalid batch: " + "; ".join(problems))
 
-    Returned gains and samples are compared with an absolute tolerance of
-    ``1e-6``.
-    """
+    reference = config.get("reference", 0)
+    if isinstance(reference, bool) or not isinstance(reference, int):
+        raise BrightnessError("reference must be an integer shot index")
+    if reference < 0 or reference >= len(shots):
+        raise BrightnessError(f"reference index {reference} is out of range")
 
-    raise NotImplementedError("match_batch is not implemented")
+    ref_shot = shots[reference]
+    gains = [match_gain(ref_shot, shot, mode) for shot in shots]
+    smoothed = smooth_gains(gains, window)
+    outliers = detect_outliers(gains, max_db)
+    gained_shots = [
+        [apply_gain(frame, smoothed[index]) for frame in shot]
+        for index, shot in enumerate(shots)
+    ]
+
+    return {
+        "gains": gains,
+        "smoothed": smoothed,
+        "outliers": outliers,
+        "shots": gained_shots,
+        "reference": reference,
+    }
